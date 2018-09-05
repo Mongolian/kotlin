@@ -138,7 +138,7 @@ public class OverridingUtil {
      */
     @NotNull
     public static <D extends CallableMemberDescriptor> Set<D> getOverriddenDeclarations(@NotNull D descriptor) {
-        Set<D> result = new LinkedHashSet<>();
+        Set<D> result = new LinkedHashSet<D>();
         collectOverriddenDeclarations(descriptor, result);
         return result;
     }
