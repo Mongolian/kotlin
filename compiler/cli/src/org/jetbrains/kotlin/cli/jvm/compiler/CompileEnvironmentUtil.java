@@ -50,7 +50,7 @@ public class CompileEnvironmentUtil {
     }
 
     // TODO: includeRuntime should be not a flag but a path to runtime
-    private static void doWriteToJar(
+    public static void writeToJarStream(
             OutputFileCollection outputFiles, OutputStream fos, @Nullable FqName mainClass, boolean includeRuntime
     ) {
         try {
@@ -80,7 +80,7 @@ public class CompileEnvironmentUtil {
         FileOutputStream outputStream = null;
         try {
             outputStream = new FileOutputStream(jarPath);
-            doWriteToJar(outputFiles, outputStream, mainClass, jarRuntime);
+            writeToJarStream(outputFiles, outputStream, mainClass, jarRuntime);
             outputStream.close();
         }
         catch (FileNotFoundException e) {

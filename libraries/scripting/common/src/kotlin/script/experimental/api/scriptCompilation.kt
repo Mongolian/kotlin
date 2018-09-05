@@ -7,13 +7,14 @@
 
 package kotlin.script.experimental.api
 
+import java.io.Serializable
 import kotlin.reflect.KClass
 import kotlin.script.experimental.util.PropertiesCollection
 
 interface ScriptCompilationConfigurationKeys
 
 open class ScriptCompilationConfiguration(baseConfigurations: Iterable<ScriptCompilationConfiguration>, body: Builder.() -> Unit) :
-    PropertiesCollection(Builder(baseConfigurations).apply(body).data) {
+    PropertiesCollection(Builder(baseConfigurations).apply(body).data), Serializable {
 
     constructor(body: Builder.() -> Unit = {}) : this(emptyList(), body)
     constructor(
@@ -25,7 +26,10 @@ open class ScriptCompilationConfiguration(baseConfigurations: Iterable<ScriptCom
         PropertiesCollection.Builder(baseConfigurations)
 
     // inherited from script compilationConfiguration for using as a keys anchor
-    companion object : ScriptCompilationConfigurationKeys
+    companion object : ScriptCompilationConfigurationKeys {
+        @JvmStatic
+        private val serialVersionUID = 0L
+    }
 
     object Default : ScriptCompilationConfiguration()
 }

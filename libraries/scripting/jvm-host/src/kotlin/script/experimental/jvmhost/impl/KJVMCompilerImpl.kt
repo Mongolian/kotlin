@@ -16,10 +16,7 @@ import org.jetbrains.kotlin.cli.common.messages.AnalyzerWithCompilerReport
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
-import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
-import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
-import org.jetbrains.kotlin.cli.jvm.compiler.NoScopeRecordCliBindingTrace
-import org.jetbrains.kotlin.cli.jvm.compiler.TopDownAnalyzerFacadeForJVM
+import org.jetbrains.kotlin.cli.jvm.compiler.*
 import org.jetbrains.kotlin.cli.jvm.config.JvmClasspathRoot
 import org.jetbrains.kotlin.cli.jvm.config.JvmModulePathRoot
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
@@ -30,12 +27,15 @@ import org.jetbrains.kotlin.codegen.KotlinCodegenFacade
 import org.jetbrains.kotlin.codegen.state.GenerationState
 import org.jetbrains.kotlin.config.*
 import org.jetbrains.kotlin.idea.KotlinLanguage
+import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.parsing.KotlinParserDefinition
 import org.jetbrains.kotlin.psi.KtFile
 import org.jetbrains.kotlin.script.KotlinScriptDefinition
 import org.jetbrains.kotlin.script.util.KotlinJars
-import java.io.File
+import java.io.*
 import java.net.URLClassLoader
+import java.util.zip.ZipInputStream
+import kotlin.IllegalStateException
 import kotlin.reflect.KClass
 import kotlin.script.experimental.api.*
 import kotlin.script.experimental.dependencies.DependenciesResolver
@@ -52,10 +52,17 @@ import kotlin.script.experimental.jvmhost.baseClassLoader
 import kotlin.script.experimental.util.getOrError
 
 class KJvmCompiledScript<out ScriptBase : Any>(
-    override val compilationConfiguration: ScriptCompilationConfiguration,
-    private val generationState: GenerationState,
-    private val scriptClassFQName: String
-) : CompiledScript<ScriptBase> {
+    compilationConfiguration: ScriptCompilationConfiguration,
+    generationState: GenerationState,
+    private var scriptClassFQName: String
+) : CompiledScript<ScriptBase>, Serializable {
+
+    private var _compilationConfiguration: ScriptCompilationConfiguration? = compilationConfiguration
+    private var generationState: GenerationState? = generationState
+    private var classesJarBytes: ByteArray? = null
+
+    override val compilationConfiguration: ScriptCompilationConfiguration
+        get() = _compilationConfiguration!!
 
     override suspend fun getClass(scriptEvaluationConfiguration: ScriptEvaluationConfiguration?): ResultWithDiagnostics<KClass<*>> = try {
         val baseClassLoader = scriptEvaluationConfiguration?.get(JvmScriptEvaluationConfiguration.baseClassLoader)
@@ -66,12 +73,93 @@ class KJvmCompiledScript<out ScriptBase : Any>(
         val classLoaderWithDeps =
             if (dependencies == null) baseClassLoader
             else URLClassLoader(dependencies.toTypedArray(), baseClassLoader)
-        val classLoader = GeneratedClassLoader(generationState.factory, classLoaderWithDeps)
+        val classLoader = when {
+            generationState != null -> GeneratedClassLoader(generationState!!.factory, classLoaderWithDeps)
+            classesJarBytes != null -> JarBytesClassLoader(classLoaderWithDeps, classesJarBytes!!)
+            else -> throw IllegalStateException("Illegal compiled class $this")
+        }
 
         val clazz = classLoader.loadClass(scriptClassFQName).kotlin
         clazz.asSuccess()
     } catch (e: Throwable) {
         ResultWithDiagnostics.Failure(ScriptDiagnostic("Unable to instantiate class $scriptClassFQName", exception = e))
+    }
+
+    // This method is exposed because the compilation configuration is not generally serializable (yet), but since it is supposed to
+    // be deserialized only from the cache, the configuration could be assigned from the cache.load method
+    fun setCompilationConfiguration(configuration: ScriptCompilationConfiguration) {
+        if (_compilationConfiguration != null) throw IllegalStateException("This method is applicable only in deserialization context")
+        _compilationConfiguration = configuration
+    }
+
+    private fun writeObject(outputStream: ObjectOutputStream) {
+        when {
+            classesJarBytes != null -> outputStream.write(classesJarBytes)
+            generationState != null -> {
+                val classesStream = ByteArrayOutputStream(1024) // TODO: measure and set optimal initial buffer size
+                // TODO: find if there is any method with less copying
+                CompileEnvironmentUtil.writeToJarStream(generationState!!.factory, classesStream, FqName(scriptClassFQName), false)
+                val bytes = classesStream.toByteArray()
+                outputStream.writeInt(bytes.size)
+                outputStream.write(bytes)
+                outputStream.writeObject(scriptClassFQName)
+            }
+            else -> throw IllegalStateException("Illegal CompiledScript class $this")
+        }
+    }
+
+    private fun readObject(inputStream: ObjectInputStream) {
+        _compilationConfiguration = null
+        generationState = null
+        val bytesSize = inputStream.readInt()
+        classesJarBytes = ByteArray(bytesSize)
+        var bytesLeftToRead = bytesSize
+        while (bytesLeftToRead > 0) {
+            val bytesRead = inputStream.read(classesJarBytes, bytesSize - bytesLeftToRead, bytesLeftToRead)
+            if (bytesRead < 0) break
+            bytesLeftToRead -= bytesRead
+        }
+        assert(bytesLeftToRead == 0)
+        scriptClassFQName = inputStream.readObject() as String
+    }
+
+    companion object {
+        @JvmStatic
+        private val serialVersionUID = 0L
+    }
+}
+
+private class JarBytesClassLoader(parent: ClassLoader, bytes: ByteArray) : ClassLoader(parent) {
+
+    private val classes = run {
+        val result = hashMapOf<String, ByteArray>()
+        val jarStream = ZipInputStream(bytes.inputStream())
+        val buffer = ByteArray(1024)
+        while (true) {
+            val entry = jarStream.nextEntry ?: break
+            if (entry.isDirectory) continue
+
+            val entrySizeGuess = entry.size.toInt().takeIf { it >= 0 } ?: 256
+            val entryBytesStream = ByteArrayOutputStream(entrySizeGuess)
+            while (true) {
+                val bytesRead = jarStream.read(buffer, 0, buffer.size)
+                if (bytesRead <= 0) break
+                entryBytesStream.write(buffer, 0, bytesRead)
+            }
+
+            result[entry.name] = entryBytesStream.toByteArray()
+        }
+        result
+    }
+
+    override fun findClass(name: String): Class<*>? {
+        val internalName = name.replace('.', '/') + ".class"
+        val classBytes = classes[internalName] ?: return null
+
+        // Clear the class, we won't need it anymore (assuming that findClass is called under a lock)
+        classes.remove(internalName)
+
+        return defineClass(name, classBytes, 0, classBytes.size)
     }
 }
 
